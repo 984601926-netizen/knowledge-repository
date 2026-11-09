@@ -1,0 +1,7 @@
+node_modules/
+dist/
+release/
+zhishi-local/
+.test-data/
+test-results/
+*.log
