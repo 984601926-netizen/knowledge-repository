@@ -148,6 +148,7 @@ try {
   fs.unlinkSync(imageFile);
   await page.getByRole("textbox", { name: "搜索知识库" }).fill("阅读笔记");
   await expect(page.locator(".item-card")).toHaveCount(1);
+  await expect(page.locator('.item-card h3')).toHaveText('阅读笔记');
   await page.locator(".item-card").click();
   await expect
     .poll(() =>
