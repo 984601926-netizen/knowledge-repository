@@ -14,7 +14,8 @@ export type Preferences = {
 export type Item = {
   id: string;
   folder_id: string | null;
-  kind: "note" | "pdf" | "image";
+  kind: "note" | "pdf" | "image" | "epub" | "word";
+  private: number;
   title: string;
   html: string;
   plain: string;

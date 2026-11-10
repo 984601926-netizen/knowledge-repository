@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash, createPublicKey } from "node:crypto";
 import { createRequire } from "node:module";
 import initSqlJs from "sql.js";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
@@ -14,11 +14,17 @@ const SQL = await initSqlJs({
   locateFile: (name) =>
     path.join(path.dirname(require.resolve("sql.js")), name),
 });
-const ASSET = /^[a-f0-9-]{36}\.(pdf|png|jpg|jpeg|gif|webp)$/;
+const ASSET = /^[a-f0-9-]{36}\.(pdf|epub|doc|docx|png|jpg|jpeg|gif|webp)$/;
 const imageTypes = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 const now = () => new Date().toISOString();
 const sha = (data) => createHash("sha256").update(data).digest("hex");
 const MAX_ARCHIVE = 512 * 1024 * 1024;
+export const localDay = (date = new Date()) =>
+  [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
 export function cleanHtml(html) {
   return sanitizeHtml(String(html || ""), {
     allowedTags: [
@@ -108,9 +114,10 @@ function validDatabase(db) {
     if (!tables.includes(name)) throw new Error("不是受支持的拾知数据库");
   const version = db.exec("SELECT value FROM meta WHERE key='version'")[0]
     ?.values[0]?.[0];
-  if (!["1", "2"].includes(version)) throw new Error("不支持此备份的数据版本");
+  if (!["1", "2", "3"].includes(version))
+    throw new Error("不支持此备份的数据版本");
   if (
-    version === "2" &&
+    ["2", "3"].includes(version) &&
     (!tables.includes("folders") ||
       !db
         .exec("PRAGMA table_info(items)")[0]
@@ -119,7 +126,105 @@ function validDatabase(db) {
     throw new Error("文件夹数据结构无效");
   if (db.exec("PRAGMA foreign_key_check").length)
     throw new Error("数据库关联校验失败");
-  if (version === "2") {
+  if (version === "3") {
+    for (const table of [
+      "habitat_state",
+      "learning_points",
+      "learning_sessions",
+      "reading_progress",
+      "focus_records",
+    ])
+      if (!tables.includes(table)) throw Error("学园数据结构不完整");
+    if (
+      !db
+        .exec("PRAGMA table_info(items)")[0]
+        ?.values.some((row) => row[1] === "private")
+    )
+      throw Error("资料隐私字段缺失");
+    for (const [key, raw] of db.exec("SELECT key,value FROM habitat_state")[0]
+      ?.values || []) {
+      let value;
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        throw Error("学园状态损坏：" + key);
+      }
+      if (key === "profile") {
+        if (
+          !value ||
+          !Array.isArray(value.plants) ||
+          !Array.isArray(value.seeds) ||
+          !Array.isArray(value.friends) ||
+          !["coins", "water", "fertilizer", "maxTime"].every(
+            (k) => Number.isFinite(value[k]) && value[k] >= 0,
+          )
+        )
+          throw Error("家园数据无效");
+        const publicKey = createPublicKey(value.privateKey)
+          .export({ type: "spki", format: "pem" })
+          .toString();
+        if (
+          publicKey !== value.publicKey ||
+          sha(publicKey).slice(0, 32) !== value.id
+        )
+          throw Error("旅人身份数据不一致");
+        for (const p of value.plants)
+          if (
+            !p.id ||
+            typeof p.species !== "string" ||
+            !["plantedAt", "caredAt", "x"].every((k) =>
+              Number.isFinite(p[k]),
+            ) ||
+            p.x < 0 ||
+            p.x > 100
+          )
+            throw Error("植物数据无效");
+        for (const s of value.seeds)
+          if (!s.id || typeof s.species !== "string")
+            throw Error("种子数据无效");
+      }
+      if (
+        key === "focus" &&
+        value !== null &&
+        (!value.id ||
+          !Number.isFinite(value.seconds) ||
+          value.seconds < 0 ||
+          typeof value.paused !== "boolean")
+      )
+        throw Error("专注记录无效");
+    }
+    for (const [raw] of db.exec("SELECT messages FROM learning_sessions")[0]
+      ?.values || []) {
+      let messages;
+      try {
+        messages = JSON.parse(raw);
+      } catch {
+        throw Error("学习对话损坏");
+      }
+      if (
+        !Array.isArray(messages) ||
+        messages.some(
+          (m) =>
+            !["user", "assistant"].includes(m.role) ||
+            typeof m.content !== "string",
+        )
+      )
+        throw Error("学习对话无效");
+    }
+    if (
+      db.exec(
+        "SELECT p.id FROM learning_points p LEFT JOIN learning_points parent ON parent.id=p.parent_id LEFT JOIN items i ON i.id=p.source_id WHERE (p.parent_id IS NOT NULL AND parent.id IS NULL) OR (p.source_id IS NOT NULL AND i.id IS NULL) OR p.state NOT IN ('draft','learning','mastered','consolidate') LIMIT 1",
+      ).length
+    )
+      throw Error("知识点关联无效");
+    if (
+      db.exec(
+        "SELECT s.id FROM learning_sessions s LEFT JOIN items i ON i.id=s.source_id WHERE s.source_id IS NOT NULL AND i.id IS NULL LIMIT 1",
+      ).length
+    )
+      throw Error("学习对话来源无效");
+  }
+  if (["2", "3"].includes(version)) {
     const columns =
       db.exec("PRAGMA table_info(folders)")[0]?.values.map((row) => row[1]) ||
       [];
@@ -148,7 +253,9 @@ function validDatabase(db) {
 function upgradeFolders(db) {
   if (
     db.exec("SELECT value FROM meta WHERE key='version'")[0]?.values[0]?.[0] ===
-    "2"
+      "2" ||
+    db.exec("SELECT value FROM meta WHERE key='version'")[0]?.values[0]?.[0] ===
+      "3"
   )
     return;
   db.run(`CREATE TABLE folders(id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_id TEXT REFERENCES folders(id) ON DELETE SET NULL,created_at TEXT NOT NULL);
@@ -156,6 +263,31 @@ function upgradeFolders(db) {
     ALTER TABLE items ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL;
     CREATE INDEX item_folder ON items(folder_id,deleted_at);
     UPDATE meta SET value='2' WHERE key='version';`);
+}
+
+function upgradeHabitat(db) {
+  if (
+    db.exec("SELECT value FROM meta WHERE key='version'")[0]?.values[0]?.[0] ===
+    "3"
+  )
+    return;
+  db.run(`CREATE TABLE items_new(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('note','pdf','image','epub','word')),title TEXT NOT NULL,
+    html TEXT NOT NULL DEFAULT '',document_json TEXT,plain TEXT NOT NULL DEFAULT '',asset TEXT,
+    favorite INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,opened_at TEXT,
+    deleted_at TEXT,index_status TEXT NOT NULL DEFAULT 'none',index_error TEXT NOT NULL DEFAULT '',
+    folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL,private INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO items_new SELECT *,0 FROM items;
+    DROP TABLE items;
+    ALTER TABLE items_new RENAME TO items;
+    CREATE INDEX items_modified ON items(deleted_at,updated_at);
+    CREATE INDEX item_folder ON items(folder_id,deleted_at);
+    CREATE TABLE habitat_state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE learning_points(id TEXT PRIMARY KEY,source_id TEXT,chapter TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,question TEXT NOT NULL,answer TEXT NOT NULL,excerpt TEXT NOT NULL,locator INTEGER NOT NULL DEFAULT 1,state TEXT NOT NULL DEFAULT 'draft',private INTEGER NOT NULL DEFAULT 0,stage INTEGER NOT NULL DEFAULT 0,due INTEGER,first_reward INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
+    CREATE INDEX learning_due ON learning_points(state,due);
+    CREATE TABLE learning_sessions(id TEXT PRIMARY KEY,source_id TEXT,topic TEXT NOT NULL,private INTEGER NOT NULL DEFAULT 0,messages TEXT NOT NULL DEFAULT '[]',updated_at TEXT NOT NULL);
+    CREATE TABLE reading_progress(source_id TEXT PRIMARY KEY,page INTEGER NOT NULL DEFAULT 1,total INTEGER NOT NULL DEFAULT 1,chapter TEXT NOT NULL DEFAULT '',max_page INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE focus_records(id TEXT PRIMARY KEY,source_id TEXT,topic TEXT NOT NULL,seconds INTEGER NOT NULL,started_at TEXT NOT NULL,ended_at TEXT NOT NULL);
+    UPDATE meta SET value='3' WHERE key='version';`);
 }
 
 export class Library {
@@ -225,6 +357,20 @@ export class Library {
           path.join(this.backupDir, "before-upgrade-" + Date.now() + ".szkb"),
         );
       this.transaction(() => upgradeFolders(this.db));
+    }
+    if (
+      this.rows("SELECT value FROM meta WHERE key='version'")[0].value !== "3"
+    ) {
+      if (existing)
+        this.backup(
+          path.join(this.backupDir, "before-habitat-" + Date.now() + ".szkb"),
+        );
+      this.db.run("PRAGMA foreign_keys=OFF");
+      try {
+        this.transaction(() => upgradeHabitat(this.db));
+      } finally {
+        this.db.run("PRAGMA foreign_keys=ON");
+      }
     }
   }
   rows(sql, args = []) {
@@ -339,6 +485,15 @@ export class Library {
       for (const id of ids) {
         if (!this.get(id).deleted_at)
           throw new Error("只能永久删除回收站中的资料");
+        this.db.run(
+          "UPDATE learning_points SET source_id=NULL WHERE source_id=?",
+          [id],
+        );
+        this.db.run(
+          "UPDATE learning_sessions SET source_id=NULL WHERE source_id=?",
+          [id],
+        );
+        this.db.run("DELETE FROM reading_progress WHERE source_id=?", [id]);
         this.db.run("DELETE FROM items WHERE id=?", [id]);
       }
     });
@@ -501,7 +656,7 @@ export class Library {
       clauses.push("i.favorite=1");
     if (filters.view === "untagged")
       clauses.push("NOT EXISTS(SELECT 1 FROM item_tags WHERE item_id=i.id)");
-    if (["note", "pdf", "image"].includes(filters.kind)) {
+    if (["note", "pdf", "image", "epub", "word"].includes(filters.kind)) {
       clauses.push("i.kind=?");
       args.push(filters.kind);
     }
@@ -534,7 +689,7 @@ export class Library {
     const limit = Math.min(200, Math.max(1, Number(filters.limit) || 100));
     const offset = Math.max(0, Number(filters.offset) || 0);
     const rows = this.rows(
-      `SELECT i.id,i.kind,i.title,i.folder_id,i.favorite,i.created_at,i.updated_at,i.opened_at,i.deleted_at,i.index_status,substr(i.plain,1,250) preview FROM items i WHERE ${clauses.join(" AND ")} ORDER BY ${order},i.id LIMIT ? OFFSET ?`,
+      `SELECT i.id,i.kind,i.title,i.folder_id,i.private,i.favorite,i.created_at,i.updated_at,i.opened_at,i.deleted_at,i.index_status,substr(i.plain,1,250) preview FROM items i WHERE ${clauses.join(" AND ")} ORDER BY ${order},i.id LIMIT ? OFFSET ?`,
       [...args, limit, offset],
     );
     // Retrieve long text only for visible results, avoiding transferring entire documents to the UI.
@@ -577,7 +732,10 @@ export class Library {
   }
   copyAsset(source) {
     const ext = path.extname(source).toLowerCase();
-    if (ext !== ".pdf" && !imageTypes.has(ext))
+    if (
+      ![".pdf", ".epub", ".doc", ".docx"].includes(ext) &&
+      !imageTypes.has(ext)
+    )
       throw new Error("不支持的文件格式");
     if (fs.statSync(source).size > 200 * 1024 * 1024)
       throw new Error("单个文件不能超过 200 MB");
@@ -621,7 +779,13 @@ export class Library {
       item: this.create(
         title,
         "",
-        ext === ".pdf" ? "pdf" : "image",
+        ext === ".pdf"
+          ? "pdf"
+          : ext === ".epub"
+            ? "epub"
+            : [".doc", ".docx"].includes(ext)
+              ? "word"
+              : "image",
         asset,
         folderId,
       ),
@@ -630,7 +794,7 @@ export class Library {
   }
   pendingPdfs() {
     return this.rows(
-      "SELECT id,asset FROM items WHERE kind='pdf' AND index_status='pending'",
+      "SELECT id,asset FROM items WHERE kind='pdf' AND (index_status='pending' OR (index_status='ready' AND NOT EXISTS(SELECT 1 FROM habitat_state WHERE key='pdf-outline:'||items.id)))",
     );
   }
   indexPdf(id, pages, error = "") {
@@ -679,11 +843,7 @@ export class Library {
     return destination;
   }
   autoBackup(date = new Date()) {
-    const day = [
-      date.getFullYear(),
-      String(date.getMonth() + 1).padStart(2, "0"),
-      String(date.getDate()).padStart(2, "0"),
-    ].join("-");
+    const day = localDay(date);
     fs.mkdirSync(this.backupDir, { recursive: true });
     const destination = path.join(this.backupDir, "auto-" + day + ".szkb");
     if (!fs.existsSync(destination)) this.backup(destination);
@@ -739,7 +899,7 @@ export class Library {
       for (const [asset, html] of rows) {
         const referenced = [
           ...String(html).matchAll(
-            /kbasset:\/\/asset\/([a-f0-9-]{36}\.(?:pdf|png|jpg|jpeg|gif|webp))/g,
+            /kbasset:\/\/asset\/([a-f0-9-]{36}\.(?:pdf|epub|doc|docx|png|jpg|jpeg|gif|webp))/g,
           ),
         ].map((m) => m[1]);
         if (asset) referenced.push(asset);
@@ -748,6 +908,11 @@ export class Library {
             throw new Error("备份缺少附件：" + name);
       }
       upgradeFolders(candidate);
+      candidate.run("PRAGMA foreign_keys=OFF");
+      upgradeHabitat(candidate);
+      candidate.run("PRAGMA foreign_keys=ON");
+      if (candidate.exec("PRAGMA foreign_key_check").length)
+        throw new Error("数据库关联校验失败");
       files["library.sqlite"] = candidate.export();
     } finally {
       candidate.close();

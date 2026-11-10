@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -43,6 +44,7 @@ import PdfReader from "./PdfReader";
 import SettingsPanel from "./SettingsPanel";
 import FolderTree, { folderPath } from "./FolderTree";
 import type { Filters, Info, Item, ListResult, Tag, Folder } from "./types";
+import type { WorldState } from "./worldTypes";
 
 const api = window.knowledge;
 const navs = [
@@ -52,7 +54,13 @@ const navs = [
   { id: "untagged", label: "未打标签", icon: Tags },
   { id: "trash", label: "回收站", icon: Trash2 },
 ];
-const kinds = { note: "笔记", pdf: "PDF", image: "图片" };
+const kinds = {
+  note: "笔记",
+  pdf: "PDF",
+  image: "图片",
+  epub: "EPUB",
+  word: "Word",
+};
 const date = (value: string) =>
   new Date(value).toLocaleString("zh-CN", {
     month: "2-digit",
@@ -71,7 +79,7 @@ type Draft = {
 };
 type Modal = { title: string; content: ReactNode } | null;
 function TypeIcon({ kind, size = 18 }: { kind: string; size?: number }) {
-  const Icon = kind === "note" ? FileText : kind === "pdf" ? File : ImageIcon;
+  const Icon = kind === "note" ? FileText : kind === "image" ? ImageIcon : File;
   return <Icon size={size} />;
 }
 function Highlight({ text, query }: { text: string; query: string }) {
@@ -88,7 +96,47 @@ function Highlight({ text, query }: { text: string; query: string }) {
     </>
   );
 }
-export default function App() {
+export default function App({
+  active = true,
+  onSelection,
+  registerFlush,
+  onStudy,
+  manageClose = true,
+  worldState,
+}: {
+  active?: boolean;
+  onSelection?: (item: Item | null) => void;
+  registerFlush?: (fn: () => Promise<boolean>) => void;
+  onStudy?: (item: Item) => void;
+  manageClose?: boolean;
+  worldState?: WorldState;
+}) {
+  const materialProgress = useMemo(() => {
+    const map = new Map<
+      string,
+      { page: number; total: number; mastered: number; points: number }
+    >();
+    for (const p of worldState?.progress || [])
+      map.set(p.source_id, {
+        page: p.page,
+        total: p.total,
+        mastered: 0,
+        points: 0,
+      });
+    for (const p of worldState?.points || [])
+      if (p.source_id && p.state !== "draft") {
+        const current = map.get(p.source_id) || {
+          page: 0,
+          total: 1,
+          mastered: 0,
+          points: 0,
+        };
+        current.points++;
+        if (p.state === "mastered") current.mastered++;
+        map.set(p.source_id, current);
+      }
+    return map;
+  }, [worldState?.progress, worldState?.points]);
   const [info, setInfo] = useState<Info | null>(null),
     [result, setResult] = useState<ListResult>({
       items: [],
@@ -216,9 +264,10 @@ export default function App() {
       .catch((e) => notify(e.message));
   }, [notify]);
   useEffect(() => {
+    if (!active) return;
     setLoading(true);
     void refresh().finally(() => setLoading(false));
-  }, [refresh]);
+  }, [refresh, active]);
   useEffect(() => {
     const timer = setTimeout(
       () => setFilters((f) => ({ ...f, query: search })),
@@ -302,6 +351,12 @@ export default function App() {
       if (savePromise.current === promise) savePromise.current = null;
     }
   }, [notify]);
+  useEffect(() => {
+    registerFlush?.(flush);
+  }, [flush, registerFlush]);
+  useEffect(() => {
+    onSelection?.(selected);
+  }, [selected, onSelection]);
   const update = useCallback(
     (patch: Partial<Draft>) => {
       const item = current.current;
@@ -345,13 +400,17 @@ export default function App() {
   );
   useEffect(
     () =>
-      api.onClose(() => {
-        void flush().then((ok) => {
-          if (ok) return api.call("close-ready");
-          notify("关闭已取消：请重试保存，成功后再关闭。");
-        });
-      }),
-    [flush, notify],
+      manageClose
+        ? api.onClose(() => {
+            void flush()
+              .then((ok) => {
+                if (ok) return api.call("close-ready");
+                notify("关闭已取消：请重试保存，成功后再关闭。");
+              })
+              .catch((e) => notify("关闭已取消：" + e.message));
+          })
+        : undefined,
+    [flush, notify, manageClose],
   );
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
@@ -564,7 +623,7 @@ export default function App() {
     });
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (modal || settingsOpen || !(e.ctrlKey || e.metaKey)) return;
+      if (!active || modal || settingsOpen || !(e.ctrlKey || e.metaKey)) return;
       if (e.key.toLowerCase() === "k") {
         e.preventDefault();
         setFocusMode(false);
@@ -873,9 +932,7 @@ export default function App() {
               <span>{n.label}</span>
               {n.id === "all" && (
                 <small>
-                  {Number(result.stats.notes) +
-                    Number(result.stats.pdfs) +
-                    Number(result.stats.images)}
+                  {Number(result.stats.total) - Number(result.stats.trash)}
                 </small>
               )}
               {n.id === "trash" && !!result.stats.trash && (
@@ -1064,6 +1121,8 @@ export default function App() {
               <option value="">全部类型</option>
               <option value="note">笔记</option>
               <option value="pdf">PDF</option>
+              <option value="epub">EPUB</option>
+              <option value="word">Word</option>
               <option value="image">图片</option>
             </select>
             <button
@@ -1223,6 +1282,33 @@ export default function App() {
                     query={filters.query}
                   />
                 </p>
+                {["pdf", "epub"].includes(item.kind) && (
+                  <div className="material-learning-progress">
+                    <span>
+                      阅读{" "}
+                      {Math.round(
+                        ((materialProgress.get(item.id)?.page || 0) /
+                          (materialProgress.get(item.id)?.total || 1)) *
+                          100,
+                      )}
+                      %
+                    </span>
+                    <span>
+                      掌握 {materialProgress.get(item.id)?.mastered || 0} /{" "}
+                      {materialProgress.get(item.id)?.points || 0} 个知识点
+                    </span>
+                    <i
+                      style={{
+                        width:
+                          Math.round(
+                            ((materialProgress.get(item.id)?.page || 0) /
+                              (materialProgress.get(item.id)?.total || 1)) *
+                              100,
+                          ) + "%",
+                      }}
+                    />
+                  </div>
+                )}
                 <div className="card-tags">
                   {item.tags.slice(0, 3).map((tag) => (
                     <span key={tag.id}>#{tag.name}</span>
@@ -1287,6 +1373,46 @@ export default function App() {
                 <span>{kinds[selected.kind]}</span>
               </div>
               <div className="content-actions">
+                {!selected.deleted_at && (
+                  <>
+                    <button
+                      title="隐私设置"
+                      onClick={async () => {
+                        try {
+                          await api.call("world:privacy", {
+                            type: "item",
+                            id: selected.id,
+                            private: !selected.private,
+                          });
+                          setSelected((s) =>
+                            s?.id === selected.id
+                              ? { ...s, private: selected.private ? 0 : 1 }
+                              : s,
+                          );
+                          notify(
+                            selected.private
+                              ? "资料已设为好友可见；衍生内容保持各自设置"
+                              : "资料及衍生知识点、对话已设为私密",
+                          );
+                        } catch (e: any) {
+                          notify(e.message);
+                        }
+                      }}
+                    >
+                      {selected.private ? "私密" : "好友可见"}
+                    </button>
+                    {selected.kind !== "word" && (
+                      <button
+                        title="在书桌学习"
+                        onClick={async () => {
+                          if (await flush()) onStudy?.(selected);
+                        }}
+                      >
+                        在书桌学习
+                      </button>
+                    )}
+                  </>
+                )}
                 {!selected.deleted_at && (
                   <button title="移动到文件夹" onClick={() => move(selected)}>
                     <MoveRight size={18} />
@@ -1492,6 +1618,17 @@ export default function App() {
                     key={selected.asset}
                     asset={selected.asset!}
                     hitPage={selected.hit_page}
+                    onPage={(page, total) => {
+                      if (active)
+                        void api
+                          .call("world:progress", {
+                            sourceId: selected.id,
+                            page,
+                            total,
+                            chapter: "第 " + page + " 页",
+                          })
+                          .catch((e) => notify(e.message));
+                    }}
                   />
                 </>
               )}
@@ -1501,6 +1638,36 @@ export default function App() {
                     src={"kbasset://asset/" + selected.asset}
                     alt={selected.title}
                   />
+                </div>
+              )}
+              {selected.kind === "epub" && (
+                <div className="empty-state">
+                  <BookOpen />
+                  <h3>EPUB 电子书</h3>
+                  <p>进入书桌阅读章节，并与老师一起学习。</p>
+                  <button
+                    onClick={async () => {
+                      if (await flush()) onStudy?.(selected);
+                    }}
+                  >
+                    打开阅读器
+                  </button>
+                </div>
+              )}
+              {selected.kind === "word" && (
+                <div className="empty-state">
+                  <FileText />
+                  <h3>Word 原始文档</h3>
+                  <p>原文件已复制到知识库。正文使用外部 Word 软件打开。</p>
+                  <button
+                    onClick={() =>
+                      void api
+                        .call("world:word-open", { id: selected.id })
+                        .catch((e) => notify(e.message))
+                    }
+                  >
+                    用 Word 打开
+                  </button>
                 </div>
               )}
               {selected.kind !== "note" && (

@@ -6,13 +6,17 @@ import {
   protocol,
   net,
   shell,
+  clipboard,
 } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Library, atomicWrite } from "./store.mjs";
+import { Library, atomicWrite, localDay } from "./store.mjs";
 import { pdfOptions } from "./pdf-options.mjs";
 import { Preferences } from "./settings.mjs";
+import { Habitat, epubChapters } from "./habitat.mjs";
+import { Teacher } from "./teacher.mjs";
+import { Social, createRelay } from "./social.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 protocol.registerSchemesAsPrivileged([
@@ -29,7 +33,8 @@ protocol.registerSchemesAsPrivileged([
 const profileArg = process.argv.find((a) => a.startsWith("--profile="));
 if (profileArg)
   app.setPath("userData", path.resolve(profileArg.slice("--profile=".length)));
-const hasLock = app.requestSingleInstanceLock();
+const relayMode = process.argv.includes("--relay-server");
+const hasLock = relayMode || app.requestSingleInstanceLock();
 if (!hasLock) app.quit();
 let library,
   preferences,
@@ -40,6 +45,14 @@ let library,
 const devURL = process.env.VITE_DEV_SERVER_URL;
 const rootArg = process.argv.find((a) => a.startsWith("--library="));
 const uiFile = path.join(here, "../dist/index.html");
+let habitat, teacher, social, worldTimer;
+function services() {
+  social?.close();
+  for (const c of teacher?.controllers?.values() || []) c.abort();
+  habitat = new Habitat(library);
+  teacher = new Teacher(habitat);
+  social = new Social(habitat);
+}
 
 async function indexPdfs() {
   if (indexing) return;
@@ -69,7 +82,39 @@ async function indexPdfs() {
           page.cleanup();
           await new Promise((resolve) => setImmediate(resolve));
         }
-        if (version === generation) library.indexPdf(item.id, pages);
+        if (version === generation) {
+          const outline = [];
+          const walk = async (entries, level = 0) => {
+            for (const entry of entries || []) {
+              if (outline.length >= 1000 || level > 12) break;
+              let dest = entry.dest;
+              if (typeof dest === "string")
+                dest = await pdf.getDestination(dest);
+              let page = 1;
+              if (Array.isArray(dest)) {
+                try {
+                  page =
+                    typeof dest[0] === "number"
+                      ? dest[0] + 1
+                      : (await pdf.getPageIndex(dest[0])) + 1;
+                } catch {}
+              }
+              outline.push({
+                title: String(entry.title || "章节").slice(0, 200),
+                page: Math.max(1, Math.min(pdf.numPages, page)),
+                level,
+              });
+              await walk(entry.items, level + 1);
+            }
+          };
+          try {
+            await walk(await pdf.getOutline());
+          } catch {}
+          if (version === generation) {
+            library.indexPdf(item.id, pages);
+            habitat.setState("pdf-outline:" + item.id, outline);
+          }
+        }
       } catch (error) {
         if (version === generation) {
           try {
@@ -106,9 +151,20 @@ async function importPaths(paths, folderId = null) {
   const results = [];
   for (const source of paths) {
     try {
+      if (fs.statSync(requireText(source, 10000)).size > 200 * 1024 * 1024)
+        throw Error("单个文件不能超过 200 MB");
+      let epub;
+      if (path.extname(String(source)).toLowerCase() === ".epub")
+        epub = epubChapters(fs.readFileSync(requireText(source, 10000)));
+      const imported = library.importFile(requireText(source, 10000), folderId);
+      if (epub)
+        library.indexPdf(
+          imported.item.id,
+          epub.map((c) => c.text),
+        );
       results.push({
         name: path.basename(source),
-        ...library.importFile(requireText(source, 10000), folderId),
+        ...imported,
         ok: true,
       });
     } catch (error) {
@@ -134,6 +190,156 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
     !isTrusted(event.sender)
   )
     throw new Error("拒绝非应用页面调用");
+  if (typeof action !== "string") throw Error("无效操作");
+  if (action.startsWith("world:")) {
+    const operation = action.slice(6);
+    let result;
+    switch (operation) {
+      case "state":
+        return {
+          ...habitat.snapshot(),
+          social: social.snapshot(),
+          warning: library.warning,
+          focusRewards: habitat.getState("reward_queue") || [],
+        };
+      case "reward-ack":
+        habitat.setState(
+          "reward_queue",
+          (habitat.getState("reward_queue") || []).filter(
+            (r) => r.eventId !== payload.id,
+          ),
+        );
+        return true;
+      case "session":
+        return habitat.session(payload);
+      case "teacher-info":
+        return teacher.info();
+      case "teacher-config":
+        return teacher.configure(payload);
+      case "teacher-cancel":
+        return teacher.cancel(payload.requestId);
+      case "chat":
+      case "extract":
+      case "assess":
+        result = await teacher.run(operation, payload);
+        break;
+      case "point-confirm":
+        result = habitat.confirmPoint(payload);
+        break;
+      case "point-discard": {
+        const p = habitat.point(id(payload.id));
+        if (p.state !== "draft") throw Error("只能丢弃尚未确认的草稿");
+        const answer = await dialog.showMessageBox(window, {
+          type: "question",
+          message: "丢弃这条知识点草稿？",
+          detail: "只移除此草稿，其下的知识点会保留。",
+          buttons: ["取消", "丢弃草稿"],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        if (answer.response !== 1) return false;
+        library.transaction(() => {
+          library.db.run(
+            "UPDATE learning_points SET parent_id=NULL WHERE parent_id=?",
+            [p.id],
+          );
+          library.db.run("DELETE FROM learning_points WHERE id=?", [p.id]);
+        });
+        result = true;
+        break;
+      }
+      case "privacy":
+        result = habitat.setPrivacy(payload);
+        break;
+      case "chapters":
+        return habitat.chapters(id(payload.id));
+      case "epub-bytes":
+        if (!payload.bytes || payload.bytes.length > 200 * 1024 * 1024)
+          throw Error("无效电子书");
+        return epubChapters(payload.bytes);
+      case "progress":
+        return habitat.progress(payload);
+      case "reading-pulse":
+        return habitat.readingPulse(id(payload.id));
+      case "focus-start":
+        result = habitat.startFocus(payload);
+        break;
+      case "focus-control":
+        result = habitat.focusControl(payload.action);
+        break;
+      case "garden":
+        result = habitat.garden(payload.action, payload);
+        break;
+      case "social-connect":
+        return social.connect(payload.url);
+      case "social-disconnect":
+        social.disconnect();
+        return true;
+      case "social-local":
+        return social.local();
+      case "copy-code":
+        clipboard.writeText(social.snapshot().code);
+        return true;
+      case "social-add":
+        return social.add(payload.code);
+      case "social-accept":
+        return social.accept(payload.id);
+      case "social-invite":
+        return social.invite(payload.id);
+      case "social-join":
+        return social.join(payload.id);
+      case "social-leave":
+        return social.leave();
+      case "social-pose":
+        social.pose = {
+          x: Math.max(2, Math.min(98, Number(payload.x) || 50)),
+          scene: payload.scene === "home" ? "home" : "garden",
+        };
+        social.publish();
+        return true;
+      case "activity":
+        social.pose.seated = !!payload.seated;
+        social.publish();
+        return true;
+      case "social-document":
+        return social.document(payload.id, payload.page);
+      case "social-catalog":
+        if (!social.hostId) throw Error("未进入好友家园");
+        return social.request(social.hostId, {
+          type: "catalog",
+          query: payload.query,
+          offset: payload.offset,
+        });
+      case "social-point":
+        if (!social.hostId) throw Error("未进入好友家园");
+        return social.request(social.hostId, { type: "point", id: payload.id });
+      case "social-file":
+        return social.file(payload.id, payload.asset);
+      case "social-download": {
+        const file = await social.file(payload.id);
+        const chosen = await dialog.showSaveDialog(window, {
+          title: "保存好友共享原文",
+          defaultPath:
+            String(file.title).replace(/[<>:"/\\|?*]/g, "_") + "." + file.ext,
+        });
+        if (chosen.canceled) return null;
+        atomicWrite(chosen.filePath, file.bytes);
+        return chosen.filePath;
+      }
+      case "word-open": {
+        const item = library.get(id(payload.id));
+        if (item.kind !== "word" || item.deleted_at)
+          throw Error("不是可打开的 Word 资料");
+        const message = await shell.openPath(library.assetPath(item.asset));
+        if (message) throw Error(message);
+        return true;
+      }
+      default:
+        throw Error("不支持的家园操作");
+    }
+    social.publish();
+    return result;
+  }
   switch (action) {
     case "info":
       return {
@@ -305,6 +511,9 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
             name: "知识资料",
             extensions: [
               "pdf",
+              "epub",
+              "doc",
+              "docx",
               "md",
               "markdown",
               "png",
@@ -342,13 +551,14 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
         title: "完整备份",
         defaultPath: path.join(
           library.backupDir,
-          "拾知备份-" + new Date().toISOString().slice(0, 10) + ".szkb",
+          "拾知备份-" + localDay() + ".szkb",
         ),
         filters: [{ name: "拾知备份", extensions: ["szkb"] }],
       });
       return result.canceled ? null : library.backup(result.filePath);
     }
     case "restore": {
+      if (teacher.busy.size) throw Error("请先等待或取消老师请求，再恢复备份");
       const result = await dialog.showOpenDialog(window, {
         title: "恢复完整备份",
         filters: [{ name: "拾知备份", extensions: ["szkb"] }],
@@ -365,6 +575,7 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
       if (confirm.response !== 1) return null;
       generation++;
       const restored = library.restore(result.filePaths[0]);
+      services();
       void indexPdfs();
       return restored;
     }
@@ -394,6 +605,7 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
       return shell.openExternal(url.href);
     }
     case "close-ready":
+      if (habitat.active) habitat.focusControl("pause");
       allowClose = true;
       window.close();
       return true;
@@ -402,7 +614,21 @@ ipcMain.handle("knowledge", async (event, action, payload = {}) => {
   }
 });
 
-if (hasLock)
+if (relayMode)
+  app.whenReady().then(() => {
+    const port = Number(
+      process.argv.find((a) => a.startsWith("--port="))?.split("=")[1] || 47831,
+    );
+    const relay = createRelay({ port });
+    relay.on("listening", () =>
+      console.log("拾知自习服务已启动，端口 " + port),
+    );
+    relay.on("error", (e) => {
+      console.error(e.message);
+      app.quit();
+    });
+  });
+if (hasLock && !relayMode)
   app.whenReady().then(async () => {
     const root = rootArg
       ? rootArg.slice("--library=".length)
@@ -421,6 +647,16 @@ if (hasLock)
       app.quit();
       return;
     }
+    services();
+    worldTimer = setInterval(() => {
+      try {
+        habitat.tick();
+        social.publish();
+        if (library.warning.startsWith("专注保存失败：")) library.warning = "";
+      } catch (e) {
+        library.warning = "专注保存失败：" + e.message;
+      }
+    }, 2000);
     protocol.handle("kbasset", async (request) => {
       try {
         const url = new URL(request.url);
@@ -448,8 +684,8 @@ if (hasLock)
       minHeight: 680,
       icon: path.join(here, "../dist/icon.png"),
       show: !process.argv.includes("--smoke-test"),
-      backgroundColor: "#f7f8fa",
-      title: "拾知 · 个人知识库",
+      backgroundColor: "#edf0e4",
+      title: "拾知 · 林间学园",
       autoHideMenuBar: true,
       webPreferences: {
         preload: path.join(here, "preload.cjs"),
@@ -491,6 +727,15 @@ app.on("second-instance", () => {
   }
 });
 app.on("window-all-closed", () => {
+  if (relayMode) return;
+  clearInterval(worldTimer);
+  try {
+    if (habitat?.getState("focus")) habitat.focusControl("pause");
+  } catch (e) {
+    console.error("专注记录保存失败", e.message);
+  }
+  social?.close();
+  for (const c of teacher?.controllers?.values() || []) c.abort();
   library?.close();
   app.quit();
 });

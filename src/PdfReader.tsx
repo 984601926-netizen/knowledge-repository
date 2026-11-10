@@ -16,10 +16,16 @@ GlobalWorkerOptions.workerSrc = worker;
 export default function PdfReader({
   asset,
   hitPage,
+  onPage,
+  bytes: suppliedBytes,
 }: {
   asset: string;
   hitPage?: number | null;
+  onPage?: (page: number, total: number) => void;
+  bytes?: Uint8Array;
 }) {
+  const onPageRef = useRef(onPage);
+  onPageRef.current = onPage;
   const canvas = useRef<HTMLCanvasElement>(null),
     [pdf, setPdf] = useState<PDFDocumentProxy | null>(null),
     [page, setPage] = useState(hitPage || 1),
@@ -33,8 +39,10 @@ export default function PdfReader({
     let disposed = false;
     let task: ReturnType<typeof getDocument> | undefined;
     // Local bytes cross the narrow preload bridge; PDF.js never needs a network URL.
-    window.knowledge
-      .call<Uint8Array>("asset-bytes", { asset })
+    (suppliedBytes
+      ? Promise.resolve(suppliedBytes)
+      : window.knowledge.call<Uint8Array>("asset-bytes", { asset })
+    )
       .then((bytes) => {
         if (disposed) return;
         const support = import.meta.env.DEV
@@ -67,6 +75,9 @@ export default function PdfReader({
       void task?.destroy();
     };
   }, [asset]);
+  useEffect(() => {
+    if (pdf) onPageRef.current?.(page, pdf.numPages);
+  }, [pdf, page]);
   useEffect(() => {
     if (pdf && hitPage) setPage(Math.min(hitPage, pdf.numPages));
   }, [hitPage, pdf]);
@@ -124,6 +135,7 @@ export default function PdfReader({
           <input
             aria-label="PDF 页码"
             type="number"
+            disabled={!pdf}
             min={1}
             max={pdf?.numPages || 1}
             value={page}
